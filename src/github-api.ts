@@ -27,6 +27,10 @@ export class GitHubAPI {
 		};
 	}
 
+	// TODO: GitHub REST API rate-limits authenticated requests to 5 000/hour. The
+	// batch upload flow creates at least 3 API calls (ref + tree + commit) plus one
+	// blob per large file. For large vaults with frequent auto-sync this can exhaust
+	// the quota. Consider caching the latest commit SHA between operations.
 	private async request(url: string, method: string = 'GET', body?: unknown): Promise<unknown> {
 		const params: RequestUrlParam = {
 			url,
@@ -127,11 +131,20 @@ export class GitHubAPI {
 	}
 
 	/**
+	 * Encode a file path for use in GitHub Contents API URLs.
+	 * Each segment must be encoded individually — encodeURIComponent on the full path
+	 * would turn '/' into '%2F', which GitHub treats as a literal slash in the filename.
+	 */
+	private encodePath(path: string): string {
+		return path.split('/').map(encodeURIComponent).join('/');
+	}
+
+	/**
 	 * Get file content from GitHub
 	 */
 	async getFileContent(path: string): Promise<string | null> {
 		try {
-			const response = await this.request(`${this.baseUrl}/contents/${encodeURIComponent(path)}?ref=${this.branch}`) as { content: string; encoding: string };
+			const response = await this.request(`${this.baseUrl}/contents/${this.encodePath(path)}?ref=${this.branch}`) as { content: string; encoding: string };
 			if (response.content && response.encoding === 'base64') {
 				return this.decodeBase64(response.content);
 			}
@@ -146,7 +159,7 @@ export class GitHubAPI {
 	 */
 	async getFileSha(path: string): Promise<string | null> {
 		try {
-			const response = await this.request(`${this.baseUrl}/contents/${encodeURIComponent(path)}?ref=${this.branch}`) as { sha: string };
+			const response = await this.request(`${this.baseUrl}/contents/${this.encodePath(path)}?ref=${this.branch}`) as { sha: string };
 			return response.sha;
 		} catch {
 			return null;
@@ -169,7 +182,7 @@ export class GitHubAPI {
 				body.sha = sha;
 			}
 
-			await this.request(`${this.baseUrl}/contents/${encodeURIComponent(path)}`, 'PUT', body);
+			await this.request(`${this.baseUrl}/contents/${this.encodePath(path)}`, 'PUT', body);
 			return true;
 		} catch (error) {
 			console.error(`Failed to upload file ${path}:`, error);
@@ -187,7 +200,7 @@ export class GitHubAPI {
 				return true; // File doesn't exist, consider it deleted
 			}
 
-			await this.request(`${this.baseUrl}/contents/${encodeURIComponent(path)}`, 'DELETE', {
+			await this.request(`${this.baseUrl}/contents/${this.encodePath(path)}`, 'DELETE', {
 				message,
 				sha,
 				branch: this.branch
@@ -256,6 +269,14 @@ export class GitHubAPI {
 
 	/**
 	 * Batch upload multiple files using Git Data API (more efficient)
+	 *
+	 * TODO: The GitHub Git Trees API has an undocumented payload-size limit. Uploading
+	 * thousands of files in a single tree POST may return a 422. Consider chunking the
+	 * upload into multiple sequential commits when files.length > 500.
+	 *
+	 * TODO: No retry logic for transient network errors. On iOS, requests can fail mid-
+	 * upload due to background suspension. Consider wrapping each request with a small
+	 * retry loop (max 3 attempts, exponential back-off).
 	 */
 	async batchUpload(files: Array<{ path: string; content: string }>, message: string): Promise<boolean> {
 		try {

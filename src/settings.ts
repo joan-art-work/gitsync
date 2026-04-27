@@ -1,6 +1,6 @@
 import { App, PluginSettingTab, Setting, Notice } from 'obsidian';
 import GitSyncPlugin from './main';
-import { GitSyncSettings, DEFAULT_SETTINGS } from './types';
+import { GitSyncSettings, DEFAULT_SETTINGS, ConflictStrategy } from './types';
 
 export type { GitSyncSettings };
 export { DEFAULT_SETTINGS };
@@ -135,6 +135,20 @@ export class GitSyncSettingTab extends PluginSettingTab {
 				.setValue(this.plugin.settings.commitMessage)
 				.onChange(async (value) => {
 					this.plugin.settings.commitMessage = value || DEFAULT_SETTINGS.commitMessage;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Conflict strategy')
+			.setDesc('How to handle files that have changed both locally and on GitHub since the last sync.')
+			.addDropdown(drop => drop
+				.addOption('newer-wins', 'Newer wins (use most recently modified version)')
+				.addOption('local-wins', 'Local wins (always keep local changes)')
+				.addOption('remote-wins', 'Remote wins (always take GitHub version)')
+				.addOption('duplicate', 'Keep both (save remote as a .conflict copy)')
+				.setValue(this.plugin.settings.conflictStrategy)
+				.onChange(async (value) => {
+					this.plugin.settings.conflictStrategy = value as ConflictStrategy;
 					await this.plugin.saveSettings();
 				}));
 

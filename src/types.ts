@@ -1,3 +1,10 @@
+export type ConflictStrategy = 'local-wins' | 'remote-wins' | 'newer-wins' | 'duplicate';
+
+export interface FileSyncState {
+	sha: string;   // GitHub blob SHA at last successful sync
+	mtime: number; // Local file mtime (ms) at last successful sync
+}
+
 export interface GitSyncSettings {
 	githubUsername: string;
 	githubToken: string;
@@ -9,6 +16,8 @@ export interface GitSyncSettings {
 	excludedFolders: string[];
 	excludedFiles: string[];
 	commitMessage: string;
+	conflictStrategy: ConflictStrategy;
+	syncedFiles: Record<string, FileSyncState>; // path → state at last sync
 }
 
 export const DEFAULT_SETTINGS: GitSyncSettings = {
@@ -21,7 +30,9 @@ export const DEFAULT_SETTINGS: GitSyncSettings = {
 	lastSyncTime: 0,
 	excludedFolders: ['{{configDir}}/plugins', '{{configDir}}/themes', '.trash'],
 	excludedFiles: ['.DS_Store', 'Thumbs.db'],
-	commitMessage: 'Obsidian sync: {{date}}'
+	commitMessage: 'Obsidian sync: {{date}}',
+	conflictStrategy: 'newer-wins',
+	syncedFiles: {}
 };
 
 export interface GitHubFile {
@@ -45,4 +56,5 @@ export interface SyncResult {
 	filesUploaded: number;
 	filesDownloaded: number;
 	filesDeleted: number;
+	conflicts: number;
 }
