@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { App, TFile, TAbstractFile } from 'obsidian';
+import { describe, it, expect, vi } from 'vitest';
+import type { App } from 'obsidian';
 import type { GitSyncSettings } from '../src/types';
 
 // ── Obsidian mock ──────────────────────────────────────────────────────────
@@ -32,11 +32,9 @@ function makeVault(files: MockTFile[] = []) {
 		getAbstractFileByPath: vi.fn((path: string) => fileMap.get(path) ?? null),
 		read: vi.fn(async (file: MockTFile) => `content of ${file.path}`),
 		readBinary: vi.fn(async () => new ArrayBuffer(4)),
-		modify: vi.fn(async (file: MockTFile, content: string) => {
-			// simulate success
-		}),
+		modify: vi.fn(async (_file: MockTFile, _content: string) => {}),
 		modifyBinary: vi.fn(async () => {}),
-		create: vi.fn(async (path: string, content: string) => {
+		create: vi.fn(async (path: string, _content: string) => {
 			const f = new MockTFile(path);
 			fileMap.set(path, f);
 			return f;
@@ -50,10 +48,22 @@ function makeVault(files: MockTFile[] = []) {
 			if (createdFolders.has(path)) throw new Error('Folder already exists.');
 			createdFolders.add(path);
 		}),
+		rename: vi.fn(async (file: MockTFile, newPath: string) => {
+			fileMap.delete(file.path);
+			file.path = newPath;
+			fileMap.set(newPath, file);
+		}),
+		adapter: {
+			exists: vi.fn().mockResolvedValue(true),
+			write: vi.fn().mockResolvedValue(undefined),
+			mkdir: vi.fn().mockResolvedValue(undefined),
+		},
 		_fileMap: fileMap,
 		_createdFolders: createdFolders
 	};
 }
+
+type MockVault = ReturnType<typeof makeVault>;
 
 function makeApp(files: MockTFile[] = []) {
 	return { vault: makeVault(files) } as unknown as App;
@@ -68,6 +78,7 @@ function makeSettings(overrides: Partial<GitSyncSettings> = {}): GitSyncSettings
 		autoSync: false,
 		autoSyncInterval: 30,
 		lastSyncTime: 0,
+		lastSyncedCommitSha: '',
 		excludedFolders: ['{{configDir}}/plugins', '.trash'],
 		excludedFiles: ['.DS_Store'],
 		commitMessage: 'sync: {{date}}',
@@ -110,11 +121,12 @@ describe('SyncService - ensureFolder (via pull)', () => {
 			getFileContent: vi.fn().mockResolvedValue('hello'),
 			getLatestCommitSha: vi.fn().mockResolvedValue('commitsha'),
 			getTreeSha: vi.fn().mockResolvedValue('treesha'),
+			getRenamedFiles: vi.fn().mockResolvedValue([]),
 		};
 		// Inject mock API
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		(service as any).api = api;
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		(service as any).settings = makeSettings();
 
 		await service.pull();
@@ -130,20 +142,23 @@ describe('SyncService - ensureFolder (via pull)', () => {
 	it('does not throw when folders already exist', async () => {
 		// vault.createFolder throws "Folder already exists." for pre-existing folders
 		const { service, app } = makeService();
-		const vault = app.vault as ReturnType<typeof makeVault>;
+		const vault = app.vault as unknown as MockVault;
 		vault.createFolder.mockImplementation(async () => {
 			throw new Error('Folder already exists.');
 		});
 
 		const api = {
+			getLatestCommitSha: vi.fn().mockResolvedValue('commitsha'),
 			getAllFiles: vi.fn().mockResolvedValue([
 				{ path: 'existing/file.md', sha: 'sha1', type: 'file' }
 			]),
 			getFileContent: vi.fn().mockResolvedValue('content'),
+			getRenamedFiles: vi.fn().mockResolvedValue([]),
 		};
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+
 		(service as any).api = api;
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+
+
 		(service as any).settings = makeSettings();
 
 		const result = await service.pull();
@@ -158,7 +173,7 @@ describe('SyncService - vault cache race condition', () => {
 	it('falls back to modify when vault.create throws and file is now found', async () => {
 		const file = new MockTFile('note.md', 1000);
 		const app = makeApp([]);
-		const vault = app.vault as ReturnType<typeof makeVault>;
+		const vault = app.vault as unknown as MockVault;
 
 		// 'note.md' has no folder component → ensureFolder makes no getAbstractFileByPath calls.
 		// writeFileContent makes: 1st call (existing check → null), 2nd call (retry → file).
@@ -169,7 +184,7 @@ describe('SyncService - vault cache race condition', () => {
 		vault.create.mockRejectedValueOnce(new Error('File already exists.'));
 
 		const service = new SyncService(app, makeSettings());
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		await (service as any).writeFileContent('note.md', 'new content');
 
 		expect(vault.modify).toHaveBeenCalledWith(file, 'new content');
@@ -177,14 +192,14 @@ describe('SyncService - vault cache race condition', () => {
 
 	it('re-throws when file genuinely cannot be written', async () => {
 		const app = makeApp([]);
-		const vault = app.vault as ReturnType<typeof makeVault>;
+		const vault = app.vault as unknown as MockVault;
 
 		vault.getAbstractFileByPath.mockReturnValue(null);
 		vault.create.mockRejectedValue(new Error('Disk full'));
 
 		const service = new SyncService(app, makeSettings());
 		await expect(
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			 
 			(service as any).writeFileContent('note.md', 'content')
 		).rejects.toThrow('Cannot write file');
 	});
@@ -198,7 +213,7 @@ describe('SyncService - file exclusion', () => {
 			excludedFolders: ['.obsidian/plugins'],
 			excludedFiles: []
 		});
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		expect((service as any).isExcluded('.obsidian/plugins/my-plugin/main.js', 'main.js')).toBe(true);
 	});
 
@@ -208,7 +223,7 @@ describe('SyncService - file exclusion', () => {
 			excludedFiles: []
 		});
 		// configDir is .obsidian in the mock
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		expect((service as any).isExcluded('.obsidian/plugins/foo/main.js', 'main.js')).toBe(true);
 	});
 
@@ -217,7 +232,7 @@ describe('SyncService - file exclusion', () => {
 			excludedFolders: [],
 			excludedFiles: ['.DS_Store']
 		});
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		expect((service as any).isExcluded('notes/.DS_Store', '.DS_Store')).toBe(true);
 	});
 
@@ -226,7 +241,7 @@ describe('SyncService - file exclusion', () => {
 			excludedFolders: ['.obsidian/plugins'],
 			excludedFiles: ['.DS_Store']
 		});
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		expect((service as any).isExcluded('notes/readme.md', 'readme.md')).toBe(false);
 	});
 });
@@ -239,7 +254,7 @@ describe('SyncService - binary file detection', () => {
 		const app = makeApp([file]);
 		app.vault.readBinary = vi.fn().mockResolvedValue(new Uint8Array([1, 2, 3]).buffer);
 		const service = new SyncService(app, makeSettings());
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		const result = await (service as any).getFileContent(file);
 		expect(result).toMatch(/^\[BINARY:/);
 		expect(result).toMatch(/\]$/);
@@ -250,7 +265,7 @@ describe('SyncService - binary file detection', () => {
 		const app = makeApp([file]);
 		app.vault.read = vi.fn().mockResolvedValue('# Hello');
 		const service = new SyncService(app, makeSettings());
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		const result = await (service as any).getFileContent(file);
 		expect(result).toBe('# Hello');
 	});
@@ -276,7 +291,7 @@ describe('SyncService - resolveConflict', () => {
 					: {}
 			})
 		);
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		return (service as any).resolveConflict(strategy, localFile, 'remote content', remoteSha) as Promise<{ writeRemote: boolean; conflictCreated: boolean }>;
 	}
 
@@ -331,10 +346,10 @@ describe('SyncService - resolveConflict', () => {
 			conflictStrategy: 'duplicate',
 			syncedFiles: { 'note.md': { sha: 'oldsha', mtime: 1000 } }
 		}));
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		const writeSpy = vi.spyOn(service as any, 'writeFileContent').mockResolvedValue(undefined);
 
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		const result = await (service as any).resolveConflict('duplicate', localFile, 'remote content', 'newsha');
 		expect(result.writeRemote).toBe(false);
 		expect(result.conflictCreated).toBe(true);
@@ -356,7 +371,7 @@ describe('SyncService.pushFile', () => {
 			putFile: vi.fn().mockResolvedValue(true),
 			getFileSha: vi.fn().mockResolvedValue('new-sha')
 		};
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		(service as any).api = api;
 
 		const result = await service.pushFile(file as unknown as import('obsidian').TFile);
@@ -370,7 +385,7 @@ describe('SyncService.pushFile', () => {
 		const { service } = makeService([file], {
 			excludedFolders: ['.obsidian/plugins']
 		});
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		(service as any).api = { putFile: vi.fn() };
 
 		const result = await service.pushFile(file as unknown as import('obsidian').TFile);
@@ -387,5 +402,264 @@ describe('SyncService.pushFile', () => {
 		});
 		const result = await service.pushFile(file as unknown as import('obsidian').TFile);
 		expect(result.success).toBe(false);
+	});
+});
+
+// ── contentSimilarity ─────────────────────────────────────────────────────────
+
+describe('SyncService - contentSimilarity', () => {
+	it('returns 1 for identical content', () => {
+		const { service } = makeService();
+		expect((service as any).contentSimilarity('a\nb\nc', 'a\nb\nc')).toBe(1);
+	});
+
+	it('returns 0 for completely different content', () => {
+		const { service } = makeService();
+		expect((service as any).contentSimilarity('foo\nbar', 'baz\nqux')).toBe(0);
+	});
+
+	it('computes partial overlap correctly (Jaccard 2/4)', () => {
+		const { service } = makeService();
+		// a,b,c vs b,c,d → intersection={b,c}, union={a,b,c,d} → 2/4 = 0.5
+		const score = (service as any).contentSimilarity('a\nb\nc', 'b\nc\nd');
+		expect(score).toBeCloseTo(0.5);
+	});
+
+	it('returns 1 when both strings are empty', () => {
+		const { service } = makeService();
+		expect((service as any).contentSimilarity('', '')).toBe(1);
+	});
+
+	it('returns 0 when one side is empty', () => {
+		const { service } = makeService();
+		expect((service as any).contentSimilarity('a\nb', '')).toBe(0);
+	});
+
+	it('ignores leading/trailing whitespace on lines', () => {
+		const { service } = makeService();
+		// '  hello  ' and 'hello' should be treated as the same line after trim
+		expect((service as any).contentSimilarity('  hello  \n  world  ', 'hello\nworld')).toBe(1);
+	});
+});
+
+// ── detectMoves ───────────────────────────────────────────────────────────────
+
+describe('SyncService - detectMoves', () => {
+	type TFileAlias = import('obsidian').TFile;
+
+	it('Phase 0: detects rename via GitHub Compare API', async () => {
+		const oldFile = new MockTFile('old/note.md', 1000);
+		const { service } = makeService([oldFile], {
+			syncedFiles: { 'old/note.md': { sha: 'sha1', mtime: 1000 } },
+			lastSyncedCommitSha: 'base-sha'
+		});
+
+		const remoteFiles = [{ path: 'new/note.md', sha: 'sha1', type: 'file' as const }];
+		const localFileMap = new Map<string, TFileAlias>([['old/note.md', oldFile as unknown as TFileAlias]]);
+
+		const api = {
+			getRenamedFiles: vi.fn().mockResolvedValue([{ oldPath: 'old/note.md', newPath: 'new/note.md' }]),
+			getFileContent: vi.fn().mockResolvedValue(null)
+		};
+		(service as any).api = api;
+
+		const moves = await service.detectMoves('head-sha', remoteFiles as any, localFileMap);
+		expect(moves).toHaveLength(1);
+		expect(moves[0]!.oldPath).toBe('old/note.md');
+		expect(moves[0]!.newPath).toBe('new/note.md');
+		// SHA unchanged → contentChanged = false
+		expect(moves[0]!.contentChanged).toBe(false);
+	});
+
+	it('Phase 0: marks contentChanged when SHA differs after rename', async () => {
+		const oldFile = new MockTFile('old/note.md', 1000);
+		const { service } = makeService([oldFile], {
+			syncedFiles: { 'old/note.md': { sha: 'old-sha', mtime: 1000 } },
+			lastSyncedCommitSha: 'base-sha'
+		});
+
+		const remoteFiles = [{ path: 'new/note.md', sha: 'new-sha', type: 'file' as const }];
+		const localFileMap = new Map<string, TFileAlias>([['old/note.md', oldFile as unknown as TFileAlias]]);
+
+		const api = {
+			getRenamedFiles: vi.fn().mockResolvedValue([{ oldPath: 'old/note.md', newPath: 'new/note.md' }]),
+			getFileContent: vi.fn().mockResolvedValue(null)
+		};
+		(service as any).api = api;
+
+		const moves = await service.detectMoves('head-sha', remoteFiles as any, localFileMap);
+		expect(moves[0]!.contentChanged).toBe(true);
+	});
+
+	it('Phase 1: detects rename via exact SHA match (no Compare API)', async () => {
+		const oldFile = new MockTFile('folder-a/note.md', 1000);
+		const { service } = makeService([oldFile], {
+			syncedFiles: { 'folder-a/note.md': { sha: 'exact-sha', mtime: 1000 } },
+			lastSyncedCommitSha: '' // disables Compare API
+		});
+
+		const remoteFiles = [{ path: 'folder-b/note.md', sha: 'exact-sha', type: 'file' as const }];
+		const localFileMap = new Map<string, TFileAlias>([['folder-a/note.md', oldFile as unknown as TFileAlias]]);
+
+		const api = { getRenamedFiles: vi.fn().mockResolvedValue([]), getFileContent: vi.fn() };
+		(service as any).api = api;
+
+		const moves = await service.detectMoves('head-sha', remoteFiles as any, localFileMap);
+		expect(moves).toHaveLength(1);
+		expect(moves[0]!.oldPath).toBe('folder-a/note.md');
+		expect(moves[0]!.newPath).toBe('folder-b/note.md');
+		expect(moves[0]!.contentChanged).toBe(false);
+	});
+
+	it('Phase 2: detects rename via content similarity', async () => {
+		const oldFile = new MockTFile('src/doc.md', 1000);
+		const app = makeApp([oldFile]);
+		(app.vault as unknown as MockVault).read = vi.fn().mockResolvedValue('line1\nline2\nline3');
+
+		const { service } = makeService([], {
+			syncedFiles: { 'src/doc.md': { sha: 'old-sha', mtime: 1000 } },
+			lastSyncedCommitSha: ''
+		});
+		(service as any).app = app;
+
+		const remoteFiles = [{ path: 'dst/doc.md', sha: 'new-sha', type: 'file' as const }];
+		const localFileMap = new Map<string, TFileAlias>([['src/doc.md', oldFile as unknown as TFileAlias]]);
+
+		// Remote content is very similar (>0.5 Jaccard) to local
+		const api = {
+			getRenamedFiles: vi.fn().mockResolvedValue([]),
+			getFileContent: vi.fn().mockResolvedValue('line1\nline2\nline3\nline4')
+		};
+		(service as any).api = api;
+
+		const moves = await service.detectMoves('head-sha', remoteFiles as any, localFileMap);
+		expect(moves).toHaveLength(1);
+		expect(moves[0]!.oldPath).toBe('src/doc.md');
+		expect(moves[0]!.newPath).toBe('dst/doc.md');
+		expect(moves[0]!.contentChanged).toBe(true);
+	});
+
+	it('Phase 2: skips binary files', async () => {
+		const oldFile = new MockTFile('img/photo.png', 1000);
+		const { service } = makeService([oldFile], {
+			syncedFiles: { 'img/photo.png': { sha: 'old-sha', mtime: 1000 } },
+			lastSyncedCommitSha: ''
+		});
+
+		const remoteFiles = [{ path: 'pics/photo.png', sha: 'new-sha', type: 'file' as const }];
+		const localFileMap = new Map<string, TFileAlias>([['img/photo.png', oldFile as unknown as TFileAlias]]);
+
+		const api = { getRenamedFiles: vi.fn().mockResolvedValue([]), getFileContent: vi.fn() };
+		(service as any).api = api;
+
+		const moves = await service.detectMoves('head-sha', remoteFiles as any, localFileMap);
+		// Binary files are excluded from Phase 2; no other phases matched → no moves
+		expect(moves).toHaveLength(0);
+		expect(api.getFileContent).not.toHaveBeenCalled();
+	});
+
+	it('returns empty when no files are missing remotely', async () => {
+		const file = new MockTFile('note.md', 1000);
+		const { service } = makeService([file], {
+			syncedFiles: { 'note.md': { sha: 'sha1', mtime: 1000 } }
+		});
+
+		// Remote still has the same file — nothing is missing
+		const remoteFiles = [{ path: 'note.md', sha: 'sha1', type: 'file' as const }];
+		const localFileMap = new Map<string, TFileAlias>([['note.md', file as unknown as TFileAlias]]);
+
+		const moves = await service.detectMoves('head-sha', remoteFiles as any, localFileMap);
+		expect(moves).toHaveLength(0);
+	});
+});
+
+// ── applyMoves ────────────────────────────────────────────────────────────────
+
+describe('SyncService - applyMoves', () => {
+	it('renames file in vault and updates syncedFiles', async () => {
+		const oldFile = new MockTFile('old/note.md', 1000);
+		const newFile = new MockTFile('new/note.md', 2000);
+		const app = makeApp([oldFile]);
+		const vault = app.vault as unknown as MockVault;
+		vault.rename = vi.fn().mockResolvedValue(undefined);
+		vault.getAbstractFileByPath = vi.fn((path: string) => {
+			if (path === 'old/note.md') return oldFile;
+			if (path === 'new/note.md') return newFile;
+			return null;
+		});
+		// ensureFolder calls createFolder for 'new'
+		vault.createFolder = vi.fn().mockResolvedValue(undefined);
+
+		const { service, settings } = makeService([], {
+			syncedFiles: { 'old/note.md': { sha: 'sha1', mtime: 1000 } }
+		});
+		(service as any).app = app;
+
+		const remoteFileMap = new Map([['new/note.md', { path: 'new/note.md', sha: 'sha2', type: 'file' as const }]]);
+		const moves = [{ oldPath: 'old/note.md', newPath: 'new/note.md', contentChanged: false }];
+
+		const count = await (service as any).applyMoves(moves, remoteFileMap);
+
+		expect(count).toBe(1);
+		expect(vault.rename).toHaveBeenCalledWith(oldFile, 'new/note.md');
+		expect(settings.syncedFiles['old/note.md']).toBeUndefined();
+		expect(settings.syncedFiles['new/note.md']?.sha).toBe('sha2');
+	});
+
+	it('fetches updated content when contentChanged is true', async () => {
+		const oldFile = new MockTFile('src/note.md', 1000);
+		const movedFile = new MockTFile('dst/note.md', 2000);
+		const app = makeApp([oldFile]);
+		const vault = app.vault as unknown as MockVault;
+		vault.rename = vi.fn().mockResolvedValue(undefined);
+		vault.modify = vi.fn().mockResolvedValue(undefined);
+		vault.getAbstractFileByPath = vi.fn((path: string) => {
+			if (path === 'src/note.md') return oldFile;
+			if (path === 'dst/note.md') return movedFile;
+			return null;
+		});
+		vault.createFolder = vi.fn().mockResolvedValue(undefined);
+
+		const { service, settings } = makeService([], {
+			syncedFiles: { 'src/note.md': { sha: 'old-sha', mtime: 1000 } }
+		});
+		(service as any).app = app;
+
+		const api = { getFileContent: vi.fn().mockResolvedValue('updated content') };
+		(service as any).api = api;
+
+		const remoteFileMap = new Map([['dst/note.md', { path: 'dst/note.md', sha: 'new-sha', type: 'file' as const }]]);
+		const moves = [{ oldPath: 'src/note.md', newPath: 'dst/note.md', contentChanged: true }];
+
+		const count = await (service as any).applyMoves(moves, remoteFileMap);
+
+		expect(count).toBe(1);
+		expect(api.getFileContent).toHaveBeenCalledWith('dst/note.md');
+		expect(vault.modify).toHaveBeenCalledWith(movedFile, 'updated content');
+		expect(settings.syncedFiles['dst/note.md']?.sha).toBe('new-sha');
+	});
+
+	it('skips move when local file no longer exists', async () => {
+		const app = makeApp([]);
+		const vault = app.vault as unknown as MockVault;
+		vault.rename = vi.fn();
+		vault.getAbstractFileByPath = vi.fn().mockReturnValue(null);
+
+		const { service } = makeService();
+		(service as any).app = app;
+
+		const remoteFileMap = new Map([['new/note.md', { path: 'new/note.md', sha: 'sha1', type: 'file' as const }]]);
+		const moves = [{ oldPath: 'old/note.md', newPath: 'new/note.md', contentChanged: false }];
+
+		const count = await (service as any).applyMoves(moves, remoteFileMap);
+
+		expect(count).toBe(0);
+		expect(vault.rename).not.toHaveBeenCalled();
+	});
+
+	it('returns 0 for empty moves array', async () => {
+		const { service } = makeService();
+		const count = await (service as any).applyMoves([], new Map());
+		expect(count).toBe(0);
 	});
 });

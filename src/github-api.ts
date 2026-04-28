@@ -110,6 +110,33 @@ export class GitHubAPI {
 	}
 
 	/**
+	 * Compare two commits and return renamed files.
+	 * Uses the GitHub Compare API which surfaces git's native rename detection
+	 * (similarity-based, same algorithm as `git diff --find-renames`).
+	 * Returns an empty array when baseSha is empty (first sync) or on error.
+	 */
+	async getRenamedFiles(baseSha: string, headSha: string): Promise<Array<{ oldPath: string; newPath: string }>> {
+		if (!baseSha || baseSha === headSha) return [];
+		try {
+			const response = await this.request(
+				`${this.baseUrl}/compare/${baseSha}...${headSha}`
+			) as {
+				files?: Array<{
+					status: string;
+					filename: string;
+					previous_filename?: string;
+				}>
+			};
+			return (response.files ?? [])
+				.filter(f => f.status === 'renamed' && f.previous_filename)
+				.map(f => ({ oldPath: f.previous_filename as string, newPath: f.filename }));
+		} catch {
+			// Compare may fail if baseSha is too old (commits were squashed) — fall back gracefully.
+			return [];
+		}
+	}
+
+	/**
 	 * Get all files in the repository
 	 */
 	async getAllFiles(): Promise<GitHubFile[]> {

@@ -13,6 +13,7 @@ export interface GitSyncSettings {
 	autoSync: boolean;
 	autoSyncInterval: number; // in minutes
 	lastSyncTime: number;
+	lastSyncedCommitSha: string; // HEAD SHA at the last successful pull/sync
 	excludedFolders: string[];
 	excludedFiles: string[];
 	commitMessage: string;
@@ -28,7 +29,8 @@ export const DEFAULT_SETTINGS: GitSyncSettings = {
 	autoSync: false,
 	autoSyncInterval: 30,
 	lastSyncTime: 0,
-	excludedFolders: ['{{configDir}}/plugins', '{{configDir}}/themes', '.trash'],
+	lastSyncedCommitSha: '',
+	excludedFolders: ['{{configDir}}', '.trash'],
 	excludedFiles: ['.DS_Store', 'Thumbs.db'],
 	commitMessage: 'Obsidian sync: {{date}}',
 	conflictStrategy: 'newer-wins',
@@ -57,4 +59,5 @@ export interface SyncResult {
 	filesDownloaded: number;
 	filesDeleted: number;
 	conflicts: number;
+	filesMoved: number;
 }

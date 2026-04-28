@@ -1,6 +1,6 @@
 import { App, TFile, Notice, normalizePath } from 'obsidian';
 import { GitHubAPI } from './github-api';
-import { GitSyncSettings, SyncResult, GitHubFile, ConflictStrategy, FileSyncState } from './types';
+import { GitSyncSettings, SyncResult, GitHubFile, ConflictStrategy } from './types';
 
 export class SyncService {
 	private app: App;
@@ -78,6 +78,11 @@ export class SyncService {
 
 	private isBinaryFile(file: TFile): boolean {
 		return this.BINARY_EXTENSIONS.has(file.extension.toLowerCase());
+	}
+
+	private isBinaryExtension(path: string): boolean {
+		const ext = path.split('.').pop()?.toLowerCase() ?? '';
+		return this.BINARY_EXTENSIONS.has(ext);
 	}
 
 	private async getFileContent(file: TFile): Promise<string> {
@@ -161,6 +166,185 @@ export class SyncService {
 		}
 	}
 
+	// ─── Move detection ───────────────────────────────────────────────────────
+
+	/**
+	 * Jaccard similarity over non-empty trimmed lines (0 = no overlap, 1 = identical).
+	 * Used as a fallback when the git rename API and SHA matching both fail.
+	 */
+	contentSimilarity(a: string, b: string): number {
+		const toLines = (s: string) =>
+			new Set(s.split('\n').map(l => l.trim()).filter(l => l.length > 0));
+		const linesA = toLines(a);
+		const linesB = toLines(b);
+		if (linesA.size === 0 && linesB.size === 0) return 1;
+		if (linesA.size === 0 || linesB.size === 0) return 0;
+		const intersection = [...linesA].filter(l => linesB.has(l)).length;
+		const union = new Set([...linesA, ...linesB]).size;
+		return intersection / union;
+	}
+
+	/**
+	 * Detect remote file moves in three phases:
+	 *
+	 * Phase 0 — GitHub Compare API (git-native rename detection, 100% accurate).
+	 *   Compares lastSyncedCommitSha..currentHead. Falls back silently if the
+	 *   base commit is missing (squash, force-push, first sync).
+	 *
+	 * Phase 1 — Exact blob SHA match against syncedFiles (100% accurate, free).
+	 *   Catches moves that git didn't surface (e.g. cross-commit moves) where
+	 *   the content was not modified.
+	 *
+	 * Phase 2 — Jaccard line similarity on text files (≥ 0.5 threshold).
+	 *   Handles moves where the file was also edited. Capped at 20 candidates
+	 *   on each side to limit extra API calls on large vaults.
+	 */
+	async detectMoves(
+		currentHeadSha: string,
+		remoteFiles: GitHubFile[],
+		localFileMap: Map<string, TFile>
+	): Promise<Array<{ oldPath: string; newPath: string; contentChanged: boolean }>> {
+		const syncedPaths = new Set(Object.keys(this.settings.syncedFiles));
+		const remotePaths = new Set(remoteFiles.map(f => f.path));
+
+		// Files present at last sync but gone from remote (potentially moved away)
+		const missingRemotely = [...syncedPaths].filter(
+			p => !remotePaths.has(p) && localFileMap.has(p)
+		);
+		// Files now on remote that weren't at last sync (potentially moved to)
+		const newRemotely = remoteFiles.filter(f => !syncedPaths.has(f.path));
+
+		if (missingRemotely.length === 0 || newRemotely.length === 0) return [];
+
+		type Move = { oldPath: string; newPath: string; contentChanged: boolean };
+		const moves: Move[] = [];
+		const matchedNew = new Set<string>();
+		const matchedOld = new Set<string>();
+
+		// ── Phase 0: git-native renames via Compare API ───────────────────────
+		if (this.api && this.settings.lastSyncedCommitSha) {
+			const gitRenames = await this.api.getRenamedFiles(
+				this.settings.lastSyncedCommitSha,
+				currentHeadSha
+			);
+			for (const { oldPath, newPath } of gitRenames) {
+				if (!localFileMap.has(oldPath)) continue;
+				if (!remotePaths.has(newPath)) continue;
+				// A rename may also have content changes — check SHAs to know
+				const oldSha = this.settings.syncedFiles[oldPath]?.sha ?? '';
+				const newSha = remoteFiles.find(f => f.path === newPath)?.sha ?? '';
+				moves.push({ oldPath, newPath, contentChanged: oldSha !== newSha });
+				matchedNew.add(newPath);
+				matchedOld.add(oldPath);
+			}
+		}
+
+		// ── Phase 1: exact blob SHA match ─────────────────────────────────────
+		const oldShaToPath = new Map<string, string>();
+		for (const p of missingRemotely) {
+			if (matchedOld.has(p)) continue;
+			const sha = this.settings.syncedFiles[p]?.sha;
+			if (sha) oldShaToPath.set(sha, p);
+		}
+		for (const newFile of newRemotely) {
+			if (matchedNew.has(newFile.path)) continue;
+			const oldPath = oldShaToPath.get(newFile.sha);
+			if (oldPath) {
+				moves.push({ oldPath, newPath: newFile.path, contentChanged: false });
+				matchedNew.add(newFile.path);
+				matchedOld.add(oldPath);
+			}
+		}
+
+		// ── Phase 2: Jaccard content similarity (text files, ≤ 20 × 20) ──────
+		const fuzzyOld = missingRemotely
+			.filter(p => !matchedOld.has(p) && !this.isBinaryExtension(p))
+			.slice(0, 20);
+		const fuzzyNew = newRemotely
+			.filter(f => !matchedNew.has(f.path) && !this.isBinaryExtension(f.path))
+			.slice(0, 20);
+
+		if (fuzzyOld.length > 0 && fuzzyNew.length > 0 && this.api) {
+			const remoteContents = new Map<string, string>();
+			for (const f of fuzzyNew) {
+				const c = await this.api.getFileContent(f.path);
+				if (c !== null) remoteContents.set(f.path, c);
+			}
+			const localContents = new Map<string, string>();
+			for (const p of fuzzyOld) {
+				const file = localFileMap.get(p);
+				if (!file) continue;
+				try { localContents.set(p, await this.app.vault.read(file)); } catch { /* skip */ }
+			}
+
+			for (const oldPath of fuzzyOld) {
+				const oldContent = localContents.get(oldPath);
+				if (!oldContent) continue;
+				let bestPath = '';
+				let bestScore = 0;
+				for (const [newPath, newContent] of remoteContents) {
+					if (matchedNew.has(newPath)) continue;
+					const score = this.contentSimilarity(oldContent, newContent);
+					if (score > 0.5 && score > bestScore) {
+						bestScore = score;
+						bestPath = newPath;
+					}
+				}
+				if (bestPath) {
+					moves.push({ oldPath, newPath: bestPath, contentChanged: true });
+					matchedNew.add(bestPath);
+					matchedOld.add(oldPath);
+				}
+			}
+		}
+
+		return moves;
+	}
+
+	/**
+	 * Apply detected moves: rename files in the vault, update their content if
+	 * needed, and refresh syncedFiles. Returns the number of moves applied.
+	 */
+	private async applyMoves(
+		moves: Array<{ oldPath: string; newPath: string; contentChanged: boolean }>,
+		remoteFileMap: Map<string, GitHubFile>
+	): Promise<number> {
+		let count = 0;
+		for (const { oldPath, newPath, contentChanged } of moves) {
+			const localFile = this.app.vault.getAbstractFileByPath(normalizePath(oldPath));
+			if (!(localFile instanceof TFile)) continue;
+			try {
+				await this.ensureFolder(newPath);
+				await this.app.vault.rename(localFile, newPath);
+				count++;
+
+				if (contentChanged && this.api) {
+					const content = await this.api.getFileContent(newPath);
+					if (content !== null) {
+						const moved = this.app.vault.getAbstractFileByPath(normalizePath(newPath));
+						if (moved instanceof TFile) await this.app.vault.modify(moved, content);
+					}
+				}
+
+				// Update sync state: drop old path, record new path
+				delete this.settings.syncedFiles[oldPath];
+				const remoteFile = remoteFileMap.get(newPath);
+				if (remoteFile) {
+					const movedFile = this.app.vault.getAbstractFileByPath(normalizePath(newPath));
+					this.settings.syncedFiles[newPath] = {
+						sha: remoteFile.sha,
+						mtime: (movedFile instanceof TFile ? movedFile.stat.mtime : null) ?? Date.now()
+					};
+				}
+
+				new Notice(`GitSync: Déplacé ${oldPath.split('/').pop()} → ${newPath}`);
+			} catch (err) {
+				console.error(`GitSync: move failed ${oldPath} → ${newPath}:`, err);
+			}
+		}
+		return count;
+	}
+
 	private getCommitMessage(): string {
 		const now = new Date();
 		const dateStr = now.toISOString().replace('T', ' ').split('.')[0] ?? '';
@@ -233,10 +417,10 @@ export class SyncService {
 
 	async push(): Promise<SyncResult> {
 		if (!this.api) {
-			return { success: false, message: 'GitHub not configured', filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0 };
+			return { success: false, message: 'GitHub not configured', filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0, filesMoved: 0 };
 		}
 		if (this.isSyncing) {
-			return { success: false, message: 'Sync already in progress', filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0 };
+			return { success: false, message: 'Sync already in progress', filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0, filesMoved: 0 };
 		}
 		this.isSyncing = true;
 		try {
@@ -251,7 +435,7 @@ export class SyncService {
 			}
 
 			if (filesToUpload.length === 0) {
-				return { success: true, message: 'No files to push', filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0 };
+				return { success: true, message: 'No files to push', filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0, filesMoved: 0 };
 			}
 
 			// TODO: GitHub Git Data API has a tree-size limit (~100 000 entries). For very large
@@ -270,11 +454,11 @@ export class SyncService {
 			}
 
 			new Notice(`GitSync: Pushed ${filesToUpload.length} files to GitHub`);
-			return { success: true, message: `Pushed ${filesToUpload.length} files`, filesUploaded: filesToUpload.length, filesDownloaded: 0, filesDeleted: 0, conflicts: 0 };
+			return { success: true, message: `Pushed ${filesToUpload.length} files`, filesUploaded: filesToUpload.length, filesDownloaded: 0, filesDeleted: 0, conflicts: 0, filesMoved: 0 };
 		} catch (error) {
 			const message = error instanceof Error ? error.message : 'Unknown error';
 			new Notice(`GitSync: Push failed - ${message}`);
-			return { success: false, message, filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0 };
+			return { success: false, message, filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0, filesMoved: 0 };
 		} finally {
 			this.isSyncing = false;
 		}
@@ -284,16 +468,16 @@ export class SyncService {
 
 	async pushFile(file: TFile): Promise<SyncResult> {
 		if (!this.api) {
-			return { success: false, message: 'GitHub not configured', filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0 };
+			return { success: false, message: 'GitHub not configured', filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0, filesMoved: 0 };
 		}
 		// TODO: isBusy check uses a single boolean; it does not distinguish between a full
 		// sync in progress and a single-file push, so a pushFile cannot run concurrently
 		// with itself. Consider a per-file lock map for finer-grained control.
 		if (this.isSyncing) {
-			return { success: false, message: 'Sync already in progress', filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0 };
+			return { success: false, message: 'Sync already in progress', filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0, filesMoved: 0 };
 		}
 		if (this.isExcluded(file.path, file.name)) {
-			return { success: false, message: 'File is excluded from sync', filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0 };
+			return { success: false, message: 'File is excluded from sync', filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0, filesMoved: 0 };
 		}
 		this.isSyncing = true;
 		try {
@@ -309,11 +493,11 @@ export class SyncService {
 			}
 
 			new Notice(`GitSync: Pushed ${file.name}`);
-			return { success: true, message: `Pushed ${file.name}`, filesUploaded: 1, filesDownloaded: 0, filesDeleted: 0, conflicts: 0 };
+			return { success: true, message: `Pushed ${file.name}`, filesUploaded: 1, filesDownloaded: 0, filesDeleted: 0, conflicts: 0, filesMoved: 0 };
 		} catch (error) {
 			const message = error instanceof Error ? error.message : 'Unknown error';
 			new Notice(`GitSync: Push failed - ${message}`);
-			return { success: false, message, filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0 };
+			return { success: false, message, filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0, filesMoved: 0 };
 		} finally {
 			this.isSyncing = false;
 		}
@@ -323,10 +507,10 @@ export class SyncService {
 
 	async pull(): Promise<SyncResult> {
 		if (!this.api) {
-			return { success: false, message: 'GitHub not configured', filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0 };
+			return { success: false, message: 'GitHub not configured', filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0, filesMoved: 0 };
 		}
 		if (this.isSyncing) {
-			return { success: false, message: 'Sync already in progress', filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0 };
+			return { success: false, message: 'Sync already in progress', filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0, filesMoved: 0 };
 		}
 		this.isSyncing = true;
 		try {
@@ -334,12 +518,27 @@ export class SyncService {
 
 			// TODO: No retry logic for individual file downloads. A transient network error
 			// on any single file aborts the entire pull. Consider retrying failed files.
+			const currentHeadSha = await this.api.getLatestCommitSha() ?? '';
 			const remoteFiles = await this.api.getAllFiles();
+			const remoteFileMap = new Map<string, GitHubFile>(remoteFiles.map(f => [f.path, f]));
+
+			// Build a full local map (not filtered) so move detection can find any file
+			const allLocalFiles = new Map<string, TFile>(
+				this.app.vault.getFiles().map(f => [f.path, f])
+			);
+
+			// Detect and apply moves before the normal download pass
+			const moves = await this.detectMoves(currentHeadSha, remoteFiles, allLocalFiles);
+			const filesMoved = await this.applyMoves(moves, remoteFileMap);
+			const movedNewPaths = new Set(moves.map(m => m.newPath));
+
 			let filesDownloaded = 0;
 			let conflicts = 0;
 
 			for (const remoteFile of remoteFiles) {
 				if (this.isExcludedPath(remoteFile.path)) continue;
+				// Skip files already handled by move detection
+				if (movedNewPaths.has(remoteFile.path)) continue;
 
 				const content = await this.api.getFileContent(remoteFile.path);
 				if (content === null) continue;
@@ -363,19 +562,26 @@ export class SyncService {
 					filesDownloaded++;
 				}
 
-				// Update sync state
 				this.settings.syncedFiles[remoteFile.path] = {
 					sha: remoteFile.sha,
 					mtime: (this.app.vault.getAbstractFileByPath(normalizePath(remoteFile.path)) as TFile | null)?.stat.mtime ?? Date.now()
 				};
 			}
 
-			new Notice(`GitSync: Pulled ${filesDownloaded} files from GitHub${conflicts > 0 ? `, ${conflicts} conflict(s)` : ''}`);
-			return { success: true, message: `Pulled ${filesDownloaded} files`, filesUploaded: 0, filesDownloaded, filesDeleted: 0, conflicts };
+			// Persist the HEAD SHA so the next pull can use the Compare API
+			this.settings.lastSyncedCommitSha = currentHeadSha;
+
+			const parts = [
+				`${filesDownloaded} fichier(s) téléchargé(s)`,
+				filesMoved > 0 ? `${filesMoved} déplacé(s)` : '',
+				conflicts > 0 ? `${conflicts} conflit(s)` : ''
+			].filter(Boolean).join(', ');
+			new Notice(`GitSync: Pull — ${parts}`);
+			return { success: true, message: `Pulled ${filesDownloaded} files, ${filesMoved} moved`, filesUploaded: 0, filesDownloaded, filesDeleted: 0, conflicts, filesMoved };
 		} catch (error) {
 			const message = error instanceof Error ? error.message : 'Unknown error';
 			new Notice(`GitSync: Pull failed - ${message}`);
-			return { success: false, message, filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0 };
+			return { success: false, message, filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0, filesMoved: 0 };
 		} finally {
 			this.isSyncing = false;
 		}
@@ -385,10 +591,10 @@ export class SyncService {
 
 	async sync(): Promise<SyncResult> {
 		if (!this.api) {
-			return { success: false, message: 'GitHub not configured', filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0 };
+			return { success: false, message: 'GitHub not configured', filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0, filesMoved: 0 };
 		}
 		if (this.isSyncing) {
-			return { success: false, message: 'Sync already in progress', filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0 };
+			return { success: false, message: 'Sync already in progress', filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0, filesMoved: 0 };
 		}
 		this.isSyncing = true;
 		try {
@@ -398,9 +604,18 @@ export class SyncService {
 
 			const vaultFiles = this.getVaultFiles();
 			const remoteFiles = await this.api.getAllFiles();
+			const currentHeadSha = await this.api.getLatestCommitSha() ?? '';
 
 			const vaultFileMap = new Map<string, TFile>(vaultFiles.map(f => [f.path, f]));
 			const remoteFileMap = new Map<string, GitHubFile>(remoteFiles.map(f => [f.path, f]));
+
+			// Detect and apply remote moves before upload/download
+			const allLocalFiles = new Map<string, TFile>(
+				this.app.vault.getFiles().map(f => [f.path, f])
+			);
+			const moves = await this.detectMoves(currentHeadSha, remoteFiles, allLocalFiles);
+			const filesMoved = await this.applyMoves(moves, remoteFileMap);
+			const movedNewPaths = new Set(moves.map(m => m.newPath));
 
 			// Upload all local files
 			const filesToUpload: Array<{ path: string; content: string }> = [];
@@ -421,6 +636,7 @@ export class SyncService {
 			// Download remote-only files and resolve conflicts for files present on both sides
 			for (const [path, remoteFile] of remoteFileMap) {
 				if (this.isExcludedPath(path)) continue;
+				if (movedNewPaths.has(path)) continue;
 
 				const localFile = vaultFileMap.get(path);
 				const content = await this.api.getFileContent(path);
@@ -451,7 +667,7 @@ export class SyncService {
 				};
 			}
 
-			// Record sync state for all uploaded local files
+			// Record sync state for all uploaded local files and persist HEAD SHA
 			const freshRemote = await this.api.getAllFiles();
 			const freshShaMap = new Map(freshRemote.map(f => [f.path, f.sha]));
 			for (const file of vaultFiles) {
@@ -460,20 +676,23 @@ export class SyncService {
 					this.settings.syncedFiles[file.path] = { sha, mtime: file.stat.mtime };
 				}
 			}
+			const finalHeadSha = await this.api.getLatestCommitSha() ?? '';
+			this.settings.lastSyncedCommitSha = finalHeadSha;
 
-			new Notice(`GitSync: Synced ${filesToUpload.length} up, ${filesDownloaded} down${conflicts > 0 ? `, ${conflicts} conflict(s)` : ''}`);
+			new Notice(`GitSync: Synced ${filesToUpload.length} up, ${filesDownloaded} down${filesMoved > 0 ? `, ${filesMoved} moved` : ''}${conflicts > 0 ? `, ${conflicts} conflict(s)` : ''}`);
 			return {
 				success: true,
 				message: `Sync complete: ${filesToUpload.length} up, ${filesDownloaded} down`,
 				filesUploaded: filesToUpload.length,
 				filesDownloaded,
 				filesDeleted: 0,
-				conflicts
+				conflicts,
+				filesMoved
 			};
 		} catch (error) {
 			const message = error instanceof Error ? error.message : 'Unknown error';
 			new Notice(`GitSync: Sync failed - ${message}`);
-			return { success: false, message, filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0 };
+			return { success: false, message, filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0, filesMoved: 0 };
 		} finally {
 			this.isSyncing = false;
 		}

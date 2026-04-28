@@ -20,17 +20,17 @@ function makeAPI() {
  * the path-encoding fix without going through a full HTTP round-trip.
  */
 function encodePath(api: GitHubAPI, path: string): string {
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	 
 	return (api as any).encodePath(path) as string;
 }
 
 function encodeBase64(api: GitHubAPI, str: string): string {
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	 
 	return (api as any).encodeBase64(str) as string;
 }
 
 function decodeBase64(api: GitHubAPI, str: string): string {
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	 
 	return (api as any).decodeBase64(str) as string;
 }
 
@@ -105,14 +105,14 @@ describe('GitHubAPI base64 encoding', () => {
 describe('GitHubAPI.verifyAccess', () => {
 	it('returns true when the repo request succeeds', async () => {
 		const api = makeAPI();
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		vi.spyOn(api as any, 'request').mockResolvedValueOnce({ id: 1 });
 		expect(await api.verifyAccess()).toBe(true);
 	});
 
 	it('returns false on any error', async () => {
 		const api = makeAPI();
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		vi.spyOn(api as any, 'request').mockRejectedValueOnce(new Error('401'));
 		expect(await api.verifyAccess()).toBe(false);
 	});
@@ -123,14 +123,14 @@ describe('GitHubAPI.verifyAccess', () => {
 describe('GitHubAPI.getFileSha', () => {
 	it('returns the sha when the file exists', async () => {
 		const api = makeAPI();
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		vi.spyOn(api as any, 'request').mockResolvedValueOnce({ sha: 'abc123' });
 		expect(await api.getFileSha('notes/readme.md')).toBe('abc123');
 	});
 
 	it('returns null when the file does not exist', async () => {
 		const api = makeAPI();
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		vi.spyOn(api as any, 'request').mockRejectedValueOnce(new Error('404'));
 		expect(await api.getFileSha('missing.md')).toBeNull();
 	});
@@ -141,7 +141,7 @@ describe('GitHubAPI.getFileSha', () => {
 describe('GitHubAPI.putFile', () => {
 	it('includes sha in body when file already exists', async () => {
 		const api = makeAPI();
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		const spy = vi.spyOn(api as any, 'request');
 		spy.mockResolvedValueOnce({ sha: 'existing-sha' }); // getFileSha
 		spy.mockResolvedValueOnce({ content: { sha: 'new-sha' } }); // PUT
@@ -154,7 +154,7 @@ describe('GitHubAPI.putFile', () => {
 
 	it('omits sha in body when file is new', async () => {
 		const api = makeAPI();
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		const spy = vi.spyOn(api as any, 'request');
 		spy.mockResolvedValueOnce(null); // getFileSha returns null via catch → need to reject
 		spy.mockImplementationOnce(async () => { throw new Error('404'); }); // getFileSha throws
