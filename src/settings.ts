@@ -162,7 +162,7 @@ export class GitSyncSettingTab extends PluginSettingTab {
 			.setDesc('Folders to exclude from sync, one per line. Use {{configDir}} for the config folder.')
 			.addTextArea(text => {
 				text
-					.setPlaceholder('{{configDir}}/plugins\n{{configDir}}/themes\n.trash')
+					.setPlaceholder('{{configDir}}\n.trash')
 					.setValue(this.plugin.settings.excludedFolders.join('\n'))
 					.onChange(async (value) => {
 						this.plugin.settings.excludedFolders = value

@@ -52,6 +52,11 @@ function makeVault(files: MockTFileInstance[] = []) {
 			if (createdFolders.has(path)) throw new Error('Folder already exists.');
 			createdFolders.add(path);
 		}),
+		adapter: {
+			exists: vi.fn().mockResolvedValue(true),
+			write: vi.fn().mockResolvedValue(undefined),
+			mkdir: vi.fn().mockResolvedValue(undefined),
+		},
 		_fileMap: fileMap,
 		_createdFolders: createdFolders
 	};
@@ -178,16 +183,38 @@ describe('SyncService - vault cache race condition', () => {
 		expect(vault.modify).toHaveBeenCalledWith(file, 'new content');
 	});
 
+	it('falls back to adapter.write for config files not in vault index (.obsidian/app.json)', async () => {
+		const app = makeApp([]);
+		const vault = app.vault as unknown as MockVault;
+
+		// Config file: getAbstractFileByPath always returns null (not in vault index),
+		// vault.create throws, but adapter.exists returns true → adapter.write is called.
+		vault.getAbstractFileByPath.mockReturnValue(null);
+		vault.create.mockRejectedValueOnce(new Error('File already exists.'));
+		const adapterWrite = vi.fn().mockResolvedValue(undefined);
+		const adapterExists = vi.fn().mockResolvedValue(true);
+		(app as any).vault.adapter = { exists: adapterExists, write: adapterWrite, mkdir: vi.fn() };
+
+		const service = new SyncService(app, makeSettings());
+		await (service as any).writeFileContent('.obsidian/app.json', '{}');
+
+		expect(adapterWrite).toHaveBeenCalledWith('.obsidian/app.json', '{}');
+	});
+
 	it('re-throws when file genuinely cannot be written', async () => {
 		const app = makeApp([]);
 		const vault = app.vault as unknown as MockVault;
 
 		vault.getAbstractFileByPath.mockReturnValue(null);
 		vault.create.mockRejectedValue(new Error('Disk full'));
+		(app as any).vault.adapter = {
+			exists: vi.fn().mockResolvedValue(false),
+			write: vi.fn(),
+			mkdir: vi.fn()
+		};
 
 		const service = new SyncService(app, makeSettings());
 		await expect(
-			 
 			(service as any).writeFileContent('note.md', 'content')
 		).rejects.toThrow('Cannot write file');
 	});

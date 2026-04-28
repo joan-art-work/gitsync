@@ -111,7 +111,6 @@ export class SyncService {
 				try {
 					await this.app.vault.createBinary(normalizedPath, bytes.buffer);
 				} catch {
-					// Vault cache may be stale on iOS — file exists on disk but not indexed yet
 					const retried = this.app.vault.getAbstractFileByPath(normalizedPath);
 					if (retried instanceof TFile) {
 						await this.app.vault.modifyBinary(retried, bytes.buffer);
@@ -128,10 +127,19 @@ export class SyncService {
 				try {
 					await this.app.vault.create(normalizedPath, content);
 				} catch {
-					// Vault cache may be stale on iOS — file exists on disk but not indexed yet
+					// 1. Stale vault cache (common on iOS): the file exists on disk but hasn't
+					//    been indexed yet — retry getAbstractFileByPath after the failed create.
 					const retried = this.app.vault.getAbstractFileByPath(normalizedPath);
 					if (retried instanceof TFile) {
 						await this.app.vault.modify(retried, content);
+						return;
+					}
+					// 2. Config-dir files (e.g. .obsidian/app.json): Obsidian does not expose
+					//    these through the normal TFile index. Fall back to the raw filesystem
+					//    adapter which bypasses the vault indexing layer entirely.
+					const adapterExists = await this.app.vault.adapter.exists(normalizedPath);
+					if (adapterExists) {
+						await this.app.vault.adapter.write(normalizedPath, content);
 					} else {
 						throw new Error(`Cannot write file: ${normalizedPath}`);
 					}
@@ -143,6 +151,8 @@ export class SyncService {
 	/**
 	 * Creates all intermediate folders for filePath, segment by segment.
 	 * vault.createFolder does NOT create missing parent dirs, so we must walk the tree.
+	 * Falls back to vault.adapter.mkdir() for directories (e.g. .obsidian/) that exist
+	 * on disk but are not exposed through the vault's TFolder index.
 	 */
 	private async ensureFolder(filePath: string): Promise<void> {
 		const parts = filePath.split('/');
@@ -155,7 +165,16 @@ export class SyncService {
 				try {
 					await this.app.vault.createFolder(current);
 				} catch {
-					// Another concurrent operation may have created it; ignore.
+					// Folder may already exist on disk but not be in the vault index
+					// (e.g. .obsidian/ sub-dirs). Use the raw adapter as a fallback.
+					const exists = await this.app.vault.adapter.exists(current);
+					if (!exists) {
+						try {
+							await this.app.vault.adapter.mkdir(current);
+						} catch {
+							// Ignore — concurrent creation or already exists.
+						}
+					}
 				}
 			}
 		}
