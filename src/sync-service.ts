@@ -1,6 +1,6 @@
 import { App, TFile, Notice, normalizePath } from 'obsidian';
 import { GitHubAPI } from './github-api';
-import { GitSyncSettings, SyncResult, GitHubFile, ConflictStrategy, FileSyncState } from './types';
+import { GitSyncSettings, SyncResult, GitHubFile, ConflictStrategy } from './types';
 
 export class SyncService {
 	private app: App;

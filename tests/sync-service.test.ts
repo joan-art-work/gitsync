@@ -1,40 +1,42 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { App, TFile, TAbstractFile } from 'obsidian';
+import { describe, it, expect, vi } from 'vitest';
+import type { App } from 'obsidian';
 import type { GitSyncSettings } from '../src/types';
 
-// ── Obsidian mock ──────────────────────────────────────────────────────────
-//
-// We cannot import the real Obsidian module (it's a bundled desktop app).
-// This mock provides the subset of the vault API that SyncService uses.
+// vi.hoisted() runs before vi.mock() factories and before any imports, so
+// MockTFile can safely be referenced inside the vi.mock() factory below.
+const MockTFile = vi.hoisted(() => {
+	return class {
+		path: string;
+		name: string;
+		extension: string;
+		stat: { mtime: number; ctime: number; size: number };
 
-class MockTFile {
-	path: string;
-	name: string;
-	extension: string;
-	stat: { mtime: number; ctime: number; size: number };
+		constructor(path: string, mtime = 1000) {
+			this.path = path;
+			const parts = path.split('/');
+			this.name = parts[parts.length - 1] ?? path;
+			this.extension = this.name.includes('.')
+				? (this.name.split('.').pop() ?? '')
+				: '';
+			this.stat = { mtime, ctime: mtime, size: 0 };
+		}
+	};
+});
 
-	constructor(path: string, mtime = 1000) {
-		this.path = path;
-		const parts = path.split('/');
-		this.name = parts[parts.length - 1] ?? path;
-		this.extension = this.name.includes('.') ? (this.name.split('.').pop() ?? '') : '';
-		this.stat = { mtime, ctime: mtime, size: 0 };
-	}
-}
+type MockTFileInstance = InstanceType<typeof MockTFile>;
 
-function makeVault(files: MockTFile[] = []) {
-	const fileMap = new Map<string, MockTFile>(files.map(f => [f.path, f]));
+function makeVault(files: MockTFileInstance[] = []) {
+	const fileMap = new Map<string, MockTFileInstance>(files.map(f => [f.path, f]));
 	const createdFolders = new Set<string>();
 
 	return {
 		configDir: '.obsidian',
 		getFiles: vi.fn(() => [...fileMap.values()]),
 		getAbstractFileByPath: vi.fn((path: string) => fileMap.get(path) ?? null),
-		read: vi.fn(async (file: MockTFile) => `content of ${file.path}`),
+		read: vi.fn(async (file: MockTFileInstance) => `content of ${file.path}`),
 		readBinary: vi.fn(async () => new ArrayBuffer(4)),
-		modify: vi.fn(async (file: MockTFile, content: string) => {
-			// simulate success
-		}),
+		modify: vi.fn(async (file: MockTFileInstance, content: string) => {
+			}),
 		modifyBinary: vi.fn(async () => {}),
 		create: vi.fn(async (path: string, content: string) => {
 			const f = new MockTFile(path);
@@ -55,7 +57,7 @@ function makeVault(files: MockTFile[] = []) {
 	};
 }
 
-function makeApp(files: MockTFile[] = []) {
+function makeApp(files: MockTFileInstance[] = []) {
 	return { vault: makeVault(files) } as unknown as App;
 }
 
@@ -83,13 +85,14 @@ vi.mock('obsidian', () => ({
 	TFile: MockTFile
 }));
 
-// ── import after mock ──────────────────────────────────────────────────────
+// Vitest hoists vi.mock() before imports, so a static import is fine here.
+import { SyncService } from '../src/sync-service';
 
-const { SyncService } = await import('../src/sync-service');
+type MockVault = ReturnType<typeof makeVault>;
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
-function makeService(files: MockTFile[] = [], settingsOverrides: Partial<GitSyncSettings> = {}) {
+function makeService(files: MockTFileInstance[] = [], settingsOverrides: Partial<GitSyncSettings> = {}) {
 	const app = makeApp(files);
 	const settings = makeSettings(settingsOverrides);
 	const service = new SyncService(app, settings);
@@ -112,9 +115,9 @@ describe('SyncService - ensureFolder (via pull)', () => {
 			getTreeSha: vi.fn().mockResolvedValue('treesha'),
 		};
 		// Inject mock API
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		(service as any).api = api;
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		(service as any).settings = makeSettings();
 
 		await service.pull();
@@ -130,7 +133,7 @@ describe('SyncService - ensureFolder (via pull)', () => {
 	it('does not throw when folders already exist', async () => {
 		// vault.createFolder throws "Folder already exists." for pre-existing folders
 		const { service, app } = makeService();
-		const vault = app.vault as ReturnType<typeof makeVault>;
+		const vault = app.vault as unknown as MockVault;
 		vault.createFolder.mockImplementation(async () => {
 			throw new Error('Folder already exists.');
 		});
@@ -141,9 +144,9 @@ describe('SyncService - ensureFolder (via pull)', () => {
 			]),
 			getFileContent: vi.fn().mockResolvedValue('content'),
 		};
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		(service as any).api = api;
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		(service as any).settings = makeSettings();
 
 		const result = await service.pull();
@@ -158,7 +161,7 @@ describe('SyncService - vault cache race condition', () => {
 	it('falls back to modify when vault.create throws and file is now found', async () => {
 		const file = new MockTFile('note.md', 1000);
 		const app = makeApp([]);
-		const vault = app.vault as ReturnType<typeof makeVault>;
+		const vault = app.vault as unknown as MockVault;
 
 		// 'note.md' has no folder component → ensureFolder makes no getAbstractFileByPath calls.
 		// writeFileContent makes: 1st call (existing check → null), 2nd call (retry → file).
@@ -169,7 +172,7 @@ describe('SyncService - vault cache race condition', () => {
 		vault.create.mockRejectedValueOnce(new Error('File already exists.'));
 
 		const service = new SyncService(app, makeSettings());
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		await (service as any).writeFileContent('note.md', 'new content');
 
 		expect(vault.modify).toHaveBeenCalledWith(file, 'new content');
@@ -177,14 +180,14 @@ describe('SyncService - vault cache race condition', () => {
 
 	it('re-throws when file genuinely cannot be written', async () => {
 		const app = makeApp([]);
-		const vault = app.vault as ReturnType<typeof makeVault>;
+		const vault = app.vault as unknown as MockVault;
 
 		vault.getAbstractFileByPath.mockReturnValue(null);
 		vault.create.mockRejectedValue(new Error('Disk full'));
 
 		const service = new SyncService(app, makeSettings());
 		await expect(
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			 
 			(service as any).writeFileContent('note.md', 'content')
 		).rejects.toThrow('Cannot write file');
 	});
@@ -198,7 +201,7 @@ describe('SyncService - file exclusion', () => {
 			excludedFolders: ['.obsidian/plugins'],
 			excludedFiles: []
 		});
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		expect((service as any).isExcluded('.obsidian/plugins/my-plugin/main.js', 'main.js')).toBe(true);
 	});
 
@@ -208,7 +211,7 @@ describe('SyncService - file exclusion', () => {
 			excludedFiles: []
 		});
 		// configDir is .obsidian in the mock
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		expect((service as any).isExcluded('.obsidian/plugins/foo/main.js', 'main.js')).toBe(true);
 	});
 
@@ -217,7 +220,7 @@ describe('SyncService - file exclusion', () => {
 			excludedFolders: [],
 			excludedFiles: ['.DS_Store']
 		});
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		expect((service as any).isExcluded('notes/.DS_Store', '.DS_Store')).toBe(true);
 	});
 
@@ -226,7 +229,7 @@ describe('SyncService - file exclusion', () => {
 			excludedFolders: ['.obsidian/plugins'],
 			excludedFiles: ['.DS_Store']
 		});
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		expect((service as any).isExcluded('notes/readme.md', 'readme.md')).toBe(false);
 	});
 });
@@ -239,7 +242,7 @@ describe('SyncService - binary file detection', () => {
 		const app = makeApp([file]);
 		app.vault.readBinary = vi.fn().mockResolvedValue(new Uint8Array([1, 2, 3]).buffer);
 		const service = new SyncService(app, makeSettings());
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		const result = await (service as any).getFileContent(file);
 		expect(result).toMatch(/^\[BINARY:/);
 		expect(result).toMatch(/\]$/);
@@ -250,7 +253,7 @@ describe('SyncService - binary file detection', () => {
 		const app = makeApp([file]);
 		app.vault.read = vi.fn().mockResolvedValue('# Hello');
 		const service = new SyncService(app, makeSettings());
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		const result = await (service as any).getFileContent(file);
 		expect(result).toBe('# Hello');
 	});
@@ -276,7 +279,7 @@ describe('SyncService - resolveConflict', () => {
 					: {}
 			})
 		);
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		return (service as any).resolveConflict(strategy, localFile, 'remote content', remoteSha) as Promise<{ writeRemote: boolean; conflictCreated: boolean }>;
 	}
 
@@ -331,10 +334,10 @@ describe('SyncService - resolveConflict', () => {
 			conflictStrategy: 'duplicate',
 			syncedFiles: { 'note.md': { sha: 'oldsha', mtime: 1000 } }
 		}));
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		const writeSpy = vi.spyOn(service as any, 'writeFileContent').mockResolvedValue(undefined);
 
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		const result = await (service as any).resolveConflict('duplicate', localFile, 'remote content', 'newsha');
 		expect(result.writeRemote).toBe(false);
 		expect(result.conflictCreated).toBe(true);
@@ -356,7 +359,7 @@ describe('SyncService.pushFile', () => {
 			putFile: vi.fn().mockResolvedValue(true),
 			getFileSha: vi.fn().mockResolvedValue('new-sha')
 		};
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		(service as any).api = api;
 
 		const result = await service.pushFile(file as unknown as import('obsidian').TFile);
@@ -370,7 +373,7 @@ describe('SyncService.pushFile', () => {
 		const { service } = makeService([file], {
 			excludedFolders: ['.obsidian/plugins']
 		});
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		 
 		(service as any).api = { putFile: vi.fn() };
 
 		const result = await service.pushFile(file as unknown as import('obsidian').TFile);
