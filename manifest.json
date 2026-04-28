@@ -1,7 +1,7 @@
 {
 	"id": "gitsync",
 	"name": "GitSync",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"minAppVersion": "0.15.0",
 	"description": "Sync your vault to GitHub. Works on mobile and desktop without Git installed.",
 	"author": "Vishal Sharma",
