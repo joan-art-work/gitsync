@@ -405,6 +405,171 @@ describe('SyncService.pushFile', () => {
 	});
 });
 
+// ── normalizeLineEndings ──────────────────────────────────────────────────────
+
+describe('SyncService - normalizeLineEndings', () => {
+	it('converts CRLF to LF', () => {
+		const { service } = makeService();
+		expect((service as any).normalizeLineEndings('a\r\nb\r\nc')).toBe('a\nb\nc');
+	});
+
+	it('leaves LF-only content unchanged', () => {
+		const { service } = makeService();
+		expect((service as any).normalizeLineEndings('a\nb\nc')).toBe('a\nb\nc');
+	});
+
+	it('handles mixed line endings', () => {
+		const { service } = makeService();
+		expect((service as any).normalizeLineEndings('a\r\nb\nc\r\n')).toBe('a\nb\nc\n');
+	});
+});
+
+// ── computeGitBlobSha ─────────────────────────────────────────────────────────
+
+describe('SyncService - computeGitBlobSha', () => {
+	it('matches the known git SHA for "hello\\n"', async () => {
+		const { service } = makeService();
+		// Verified: git hash-object /tmp/hello.txt (file containing "hello\n")
+		const sha = await (service as any).computeGitBlobSha('hello\n');
+		expect(sha).toBe('ce013625030ba8dba906f756967f9e9ca394464a');
+	});
+
+	it('produces different SHAs for CRLF vs LF content', async () => {
+		const { service } = makeService();
+		const shaLF   = await (service as any).computeGitBlobSha('line1\nline2\n');
+		const shaCRLF = await (service as any).computeGitBlobSha('line1\r\nline2\r\n');
+		expect(shaLF).not.toBe(shaCRLF);
+	});
+});
+
+// ── hasContentChanged ─────────────────────────────────────────────────────────
+
+describe('SyncService - hasContentChanged', () => {
+	it('returns true for a file with no sync state (never synced)', async () => {
+		const file = new MockTFile('note.md', 2000);
+		const { service } = makeService([file], { syncedFiles: {} });
+		expect(await (service as any).hasContentChanged(file, 'content')).toBe(true);
+	});
+
+	it('returns false when mtime has not changed since last sync', async () => {
+		const file = new MockTFile('note.md', 1000);
+		const { service } = makeService([file], {
+			syncedFiles: { 'note.md': { sha: 'old-sha', mtime: 1000 } }
+		});
+		expect(await (service as any).hasContentChanged(file, 'content')).toBe(false);
+	});
+
+	it('returns false when only CRLF line endings differ (content SHA matches)', async () => {
+		const file = new MockTFile('note.md', 2000);
+		const { service } = makeService([file]);
+		// Pre-compute SHA of the LF-normalized content
+		const lfContent = 'line1\nline2\n';
+		const sha: string = await (service as any).computeGitBlobSha(lfContent);
+		(service as any).settings.syncedFiles = { 'note.md': { sha, mtime: 1000 } };
+		// Pass in already-normalized content — SHA should match
+		expect(await (service as any).hasContentChanged(file, lfContent)).toBe(false);
+	});
+
+	it('returns true when content genuinely changed', async () => {
+		const file = new MockTFile('note.md', 2000);
+		const { service } = makeService([file], {
+			syncedFiles: { 'note.md': { sha: 'old-sha', mtime: 1000 } }
+		});
+		expect(await (service as any).hasContentChanged(file, 'new content')).toBe(true);
+	});
+
+	it('returns true for binary files when mtime changed (skips SHA check)', async () => {
+		const file = new MockTFile('photo.png', 2000);
+		const { service } = makeService([file], {
+			syncedFiles: { 'photo.png': { sha: 'any-sha', mtime: 1000 } }
+		});
+		// Binary: mtime changed → always push, no SHA computation
+		expect(await (service as any).hasContentChanged(file, '[BINARY:abc]')).toBe(true);
+	});
+});
+
+// ── push: smart diff ──────────────────────────────────────────────────────────
+
+describe('SyncService.push - smart diff', () => {
+	function makeApiStub(overrides: Record<string, unknown> = {}) {
+		return {
+			ensureRepository: vi.fn().mockResolvedValue(true),
+			batchUpload: vi.fn().mockResolvedValue(true),
+			getAllFiles: vi.fn().mockResolvedValue([]),
+			...overrides
+		};
+	}
+
+	it('skips unchanged files (mtime not changed)', async () => {
+		const file = new MockTFile('note.md', 1000);
+		const { service, settings } = makeService([file], {
+			syncedFiles: { 'note.md': { sha: 'sha1', mtime: 1000 } }
+		});
+		const api = makeApiStub();
+		(service as any).api = api;
+
+		await service.push();
+
+		expect(api.batchUpload).not.toHaveBeenCalled();
+	});
+
+	it('skips files where only CRLF differs', async () => {
+		const file = new MockTFile('note.md', 2000);
+		const lfContent = 'line1\nline2\n';
+		const app = makeApp([file]);
+		(app.vault as unknown as MockVault).read = vi.fn().mockResolvedValue('line1\r\nline2\r\n');
+
+		const { service, settings } = makeService([], {
+			syncedFiles: {}
+		});
+		(service as any).app = app;
+
+		// Compute what the SHA of the LF content would be
+		const sha: string = await (service as any).computeGitBlobSha(lfContent);
+		(service as any).settings = { ...(service as any).settings, syncedFiles: { 'note.md': { sha, mtime: 1000 } } };
+
+		const api = makeApiStub();
+		(service as any).api = api;
+
+		await service.push();
+
+		expect(api.batchUpload).not.toHaveBeenCalled();
+	});
+
+	it('pushes only the files that genuinely changed', async () => {
+		const unchanged = new MockTFile('unchanged.md', 1000);
+		const changed = new MockTFile('changed.md', 2000);
+		const app = makeApp([unchanged, changed]);
+		const vault = app.vault as unknown as MockVault;
+		vault.read = vi.fn().mockImplementation(async (f: MockTFile) =>
+			f.path === 'changed.md' ? 'new content' : 'same content'
+		);
+
+		const { service } = makeService([], {
+			syncedFiles: {
+				'unchanged.md': { sha: 'old', mtime: 1000 },
+				'changed.md': { sha: 'old', mtime: 1000 }
+			}
+		});
+		(service as any).app = app;
+
+		const api = makeApiStub({
+			getAllFiles: vi.fn().mockResolvedValue([
+				{ path: 'unchanged.md', sha: 'old' },
+				{ path: 'changed.md', sha: 'new' }
+			])
+		});
+		(service as any).api = api;
+
+		await service.push();
+
+		expect(api.batchUpload).toHaveBeenCalledOnce();
+		const [files] = (api.batchUpload as ReturnType<typeof vi.fn>).mock.calls[0] as [Array<{path: string}>];
+		expect(files).toHaveLength(1);
+		expect(files[0]!.path).toBe('changed.md');
+	});
+});
+
 // ── contentSimilarity ─────────────────────────────────────────────────────────
 
 describe('SyncService - contentSimilarity', () => {

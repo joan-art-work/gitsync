@@ -98,6 +98,43 @@ export class SyncService {
 		return await this.app.vault.read(file);
 	}
 
+	private normalizeLineEndings(content: string): string {
+		return content.replace(/\r\n/g, '\n');
+	}
+
+	/**
+	 * Compute the git blob SHA-1 for a given string content.
+	 * Formula: sha1("blob N\0" + content_utf8) where N is the UTF-8 byte length.
+	 * This matches GitHub's blob SHA exactly, so we can compare against stored SHAs
+	 * without making any API calls.
+	 */
+	private async computeGitBlobSha(content: string): Promise<string> {
+		const encoder = new TextEncoder();
+		const contentBytes = encoder.encode(content);
+		const header = encoder.encode(`blob ${contentBytes.length}\0`);
+		const data = new Uint8Array(header.length + contentBytes.length);
+		data.set(header);
+		data.set(contentBytes, header.length);
+		const hashBuffer = await crypto.subtle.digest('SHA-1', data);
+		return Array.from(new Uint8Array(hashBuffer))
+			.map(b => b.toString(16).padStart(2, '0'))
+			.join('');
+	}
+
+	/**
+	 * Returns true if the file content differs from what was last synced.
+	 * For text files, content must already be CRLF-normalized before calling.
+	 * Binary files rely on mtime only (their content format is opaque).
+	 */
+	private async hasContentChanged(file: TFile, normalizedContent: string): Promise<boolean> {
+		const lastSync = this.settings.syncedFiles[file.path];
+		if (!lastSync) return true; // never synced → always push
+		if (file.stat.mtime <= lastSync.mtime) return false; // mtime unchanged → skip
+		if (this.isBinaryFile(file)) return true; // binary: trust mtime alone
+		const sha = await this.computeGitBlobSha(normalizedContent);
+		return sha !== lastSync.sha; // CRLF-only diff → SHAs match → skip
+	}
+
 	private async writeFileContent(path: string, content: string): Promise<void> {
 		const normalizedPath = normalizePath(path);
 		await this.ensureFolder(normalizedPath);
@@ -431,11 +468,15 @@ export class SyncService {
 			const vaultFiles = this.getVaultFiles();
 			const filesToUpload: Array<{ path: string; content: string }> = [];
 			for (const file of vaultFiles) {
-				filesToUpload.push({ path: file.path, content: await this.getFileContent(file) });
+				const raw = await this.getFileContent(file);
+				const content = this.isBinaryFile(file) ? raw : this.normalizeLineEndings(raw);
+				if (!await this.hasContentChanged(file, content)) continue;
+				filesToUpload.push({ path: file.path, content });
 			}
 
 			if (filesToUpload.length === 0) {
-				return { success: true, message: 'No files to push', filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0, filesMoved: 0 };
+				new Notice('GitSync: nothing to push');
+				return { success: true, message: 'Nothing to push', filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0, filesMoved: 0 };
 			}
 
 			// TODO: GitHub Git Data API has a tree-size limit (~100 000 entries). For very large
@@ -482,7 +523,12 @@ export class SyncService {
 		this.isSyncing = true;
 		try {
 			new Notice(`GitSync: Pushing ${file.name}…`);
-			const content = await this.getFileContent(file);
+			const raw = await this.getFileContent(file);
+			const content = this.isBinaryFile(file) ? raw : this.normalizeLineEndings(raw);
+			if (!await this.hasContentChanged(file, content)) {
+				new Notice(`GitSync: ${file.name} — aucune modification`);
+				return { success: true, message: `${file.name} already up to date`, filesUploaded: 0, filesDownloaded: 0, filesDeleted: 0, conflicts: 0, filesMoved: 0 };
+			}
 			const success = await this.api.putFile(file.path, content, this.getCommitMessage());
 			if (!success) throw new Error(`Failed to upload ${file.name}`);
 

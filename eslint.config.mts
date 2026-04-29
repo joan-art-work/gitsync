@@ -31,6 +31,13 @@ export default tseslint.config(
 		"versions.json",
 		"main.js",
 	]),
+	// 'GitSync:' is a plugin-identifier prefix, not regular UI text — exempt it.
+	{
+		plugins: { obsidianmd },
+		rules: {
+			"obsidianmd/ui/sentence-case": ["error", { enforceCamelCaseLower: true, ignoreRegex: ["^GitSync:"] }]
+		}
+	},
 	{
 		files: ["tests/**/*.ts"],
 		rules: {
